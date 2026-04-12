@@ -17,7 +17,7 @@ async fn send_and_drain_one(port: usize, payload: &[u8]) {
     let cancel = Arc::new(CancellationToken::new());
     let (tx, mut rx) = mpsc::unbounded_channel::<Arc<[u8]>>();
 
-    start_udp_listener(conf, cancel.clone(), tx, port).unwrap();
+    let listener = start_udp_listener(conf, cancel.clone(), tx, port).unwrap();
 
     let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     sender
@@ -31,6 +31,7 @@ async fn send_and_drain_one(port: usize, payload: &[u8]) {
         .unwrap();
 
     cancel.cancel();
+    listener.wait().await;
 }
 
 /// Start listener on `port` with `workers`, send `count` datagrams, drain all.
@@ -43,7 +44,7 @@ async fn send_and_drain_many(port: usize, payload: &[u8], workers: usize, count:
     let cancel = Arc::new(CancellationToken::new());
     let (tx, mut rx) = mpsc::unbounded_channel::<Arc<[u8]>>();
 
-    start_udp_listener(conf, cancel.clone(), tx, port).unwrap();
+    let listener = start_udp_listener(conf, cancel.clone(), tx, port).unwrap();
 
     let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let dst = format!("127.0.0.1:{port}");
@@ -58,6 +59,7 @@ async fn send_and_drain_many(port: usize, payload: &[u8], workers: usize, count:
     }
 
     cancel.cancel();
+    listener.wait().await;
 }
 
 /// Single-worker throughput for payloads of 64 / 512 / 1024 / 8192 bytes.

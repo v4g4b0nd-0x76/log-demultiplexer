@@ -1,30 +1,45 @@
 use std::sync::Arc;
 
+use tokio::task::JoinHandle;
 use tokio::{net::UdpSocket, sync::mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
 use crate::{MultiplexerError, conf::Config};
+
+pub struct UdpListener {
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl UdpListener {
+    pub async fn wait(self) {
+        for worker in self.workers {
+            let _ = worker.await;
+        }
+    }
+}
 
 pub fn start_udp_listener(
     conf: Arc<Config>,
     cancel_token: Arc<CancellationToken>,
     tx: UnboundedSender<Arc<[u8]>>,
     port: usize,
-) -> Result<(), MultiplexerError> {
+) -> Result<UdpListener, MultiplexerError> {
+    let sock = std::net::UdpSocket::bind(format!("127.0.0.1:{port}"))
+        .map_err(|err| MultiplexerError::InitUdpListener(err.to_string()))?;
+    sock.set_nonblocking(true)
+        .map_err(|err| MultiplexerError::InitUdpListener(err.to_string()))?;
     let sock = Arc::new(
-        std::net::UdpSocket::bind(format!("127.0.0.1:{port}"))
+        UdpSocket::from_std(sock)
             .map_err(|err| MultiplexerError::InitUdpListener(err.to_string()))?,
     );
+    let mut workers = Vec::with_capacity(conf.conn_workers);
 
     for _ in 0..conf.conn_workers {
-        let sock = sock
-            .try_clone()
-            .map_err(|err| MultiplexerError::InitUdpListener(err.to_string()))?;
+        let sock = Arc::clone(&sock);
         let cancel_token = cancel_token.clone();
         let conf = conf.clone();
         let tx = tx.clone();
-        tokio::spawn(async move {
-            let sock = UdpSocket::from_std(sock).unwrap();
+        workers.push(tokio::spawn(async move {
             let mut buf = vec![0u8; conf.udp_buffer_size];
 
             loop {
@@ -33,7 +48,7 @@ pub fn start_udp_listener(
                     result = sock.recv_from(&mut buf) => {
                         match result {
                             Ok((len, addr)) => {
-                                println!("{:?} bytes received from {:?}", len, addr);
+                                let _ = addr;
                                 let data: Arc<[u8]> = Arc::from(&buf[..len]);
                                 let _ = tx.send(data);
                             }
@@ -45,10 +60,10 @@ pub fn start_udp_listener(
                     }
                 }
             }
-        });
+        }));
     }
 
-    Ok(())
+    Ok(UdpListener { workers })
 }
 
 #[cfg(test)]
@@ -73,7 +88,7 @@ mod tests {
         let cancel = Arc::new(CancellationToken::new());
         let (tx, mut rx) = mpsc::unbounded_channel::<Arc<[u8]>>();
 
-        start_udp_listener(conf, cancel.clone(), tx, 15100).unwrap();
+        let listener = start_udp_listener(conf, cancel.clone(), tx, 15100).unwrap();
 
         let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sender.send_to(b"hello", "127.0.0.1:15100").await.unwrap();
@@ -85,6 +100,7 @@ mod tests {
 
         assert_eq!(&*data, b"hello");
         cancel.cancel();
+        listener.wait().await;
     }
 
     #[tokio::test]
@@ -93,9 +109,9 @@ mod tests {
         let cancel = Arc::new(CancellationToken::new());
         let (tx, _rx) = mpsc::unbounded_channel::<Arc<[u8]>>();
 
-        start_udp_listener(conf, cancel.clone(), tx, 15101).unwrap();
+        let listener = start_udp_listener(conf, cancel.clone(), tx, 15101).unwrap();
         cancel.cancel();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        listener.wait().await;
     }
 
     #[tokio::test]
@@ -104,7 +120,7 @@ mod tests {
         let cancel = Arc::new(CancellationToken::new());
         let (tx, mut rx) = mpsc::unbounded_channel::<Arc<[u8]>>();
 
-        start_udp_listener(conf, cancel.clone(), tx, 15102).unwrap();
+        let listener = start_udp_listener(conf, cancel.clone(), tx, 15102).unwrap();
 
         let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         for i in 0u8..5 {
@@ -120,5 +136,6 @@ mod tests {
         }
 
         cancel.cancel();
+        listener.wait().await;
     }
 }

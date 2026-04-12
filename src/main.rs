@@ -15,7 +15,7 @@ async fn main() -> Result<(), MultiplexerError> {
     let cancel_token = Arc::new(CancellationToken::new());
 
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Arc<[u8]>>();
-    start_udp_listener(
+    let listener = start_udp_listener(
         Arc::clone(&conf),
         Arc::clone(&cancel_token),
         tx,
@@ -29,6 +29,7 @@ async fn main() -> Result<(), MultiplexerError> {
 
     wait_for_shutdown().await;
     cancel_token.cancel();
+    listener.wait().await;
 
     Ok(())
 }

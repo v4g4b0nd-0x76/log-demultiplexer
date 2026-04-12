@@ -1,0 +1,28 @@
+[package]
+name = "log_demultiplexer"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "log_demultiplexer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "log_demultiplexer"
+path = "src/main.rs"
+
+[[bench]]
+name = "udp_bench"
+harness = false
+
+[dependencies]
+rayon = "1.11.0"
+serde = { version = "1.0.228", features = ["derive"] }
+simd-json = { version = "0.17.0", features = ["serde"] }
+tokio = { version = "1.51.1", features = ["full"] }
+tokio-util = "0.7.18"
+toml = "1.1.2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+tokio = { version = "1", features = ["full"] }

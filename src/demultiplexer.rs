@@ -494,8 +494,8 @@ fn build_elastic_client(consumer: &Consumer) -> Result<Elasticsearch, Multiplexe
 
 fn redis_url(consumer: &Consumer) -> String {
     match &consumer.password {
-        Some(pass) => format!("redis:
-        None => format!("redis:
+        Some(pass) => format!("redis://:{}@{}", encode(pass), consumer.addr),
+        None => format!("redis://{}", consumer.addr),
     }
 }
 

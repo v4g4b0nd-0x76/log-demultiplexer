@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Display};
 use tokio::fs;
 
-#[derive(Debug, serde::Deserialize, PartialEq)]
+#[derive(Clone, Debug, serde::Deserialize, PartialEq)]
 pub enum ParsedBatch {
     Str(Vec<String>),
     Json(Vec<serde_json::Value>),
@@ -26,18 +26,26 @@ pub struct Config {
     pub parse_type: ParseType,
 }
 
-fn default_udp_buffer_size() -> usize { 1024 }
-fn default_conn_workers() -> usize { 4 }
-fn default_port() -> usize { 5401 }
-fn default_parse_batch_thresh() -> usize { 1000 }
+fn default_udp_buffer_size() -> usize {
+    1024
+}
+fn default_conn_workers() -> usize {
+    4
+}
+fn default_port() -> usize {
+    5401
+}
+fn default_parse_batch_thresh() -> usize {
+    1000
+}
 
 impl Config {
     pub async fn load() -> Result<Self, ConfError> {
         let content = fs::read_to_string("config.toml")
             .await
             .map_err(|e| ConfError::LoadError(e.to_string()))?;
-        let config: Config = toml::from_str(&content)
-            .map_err(|e| ConfError::ParseError(e.to_string()))?;
+        let config: Config =
+            toml::from_str(&content).map_err(|e| ConfError::ParseError(e.to_string()))?;
         config.validate()?;
         Ok(config)
     }

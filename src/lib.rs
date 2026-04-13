@@ -1,4 +1,6 @@
 pub mod conf;
+pub mod consumers;
+pub mod demultiplexer;
 pub mod parser;
 pub mod udp_listener;
 use std::fmt::Debug;
@@ -8,6 +10,7 @@ pub enum MultiplexerError {
     AcceptUdpConn(String),
     LoadConfig(conf::ConfError),
     SpawnWorker((usize, String)),
+    LoadConsumers(String),
 }
 
 impl Debug for MultiplexerError {
@@ -23,6 +26,7 @@ impl Debug for MultiplexerError {
             MultiplexerError::SpawnWorker((worker, err)) => {
                 write!(f, "failed to spawn worker {}: {}", worker, err)
             }
+            MultiplexerError::LoadConsumers(err) => write!(f, "failed to load consumers: {}", err),
         }
     }
 }

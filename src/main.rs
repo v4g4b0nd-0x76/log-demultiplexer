@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 use log_demultiplexer::conf::ParsedBatch;
+use log_demultiplexer::consumers::Consumers;
 use tokio_util::sync::CancellationToken;
 
 use log_demultiplexer::MultiplexerError;
+use log_demultiplexer::demultiplexer::start_demultiplexer;
 use log_demultiplexer::parser::start_parser;
 use log_demultiplexer::udp_listener::start_udp_listener;
 #[tokio::main]
@@ -24,15 +26,26 @@ async fn main() -> Result<(), MultiplexerError> {
         conf.as_ref().port,
     )?;
 
-    let (d_tx, _d_rx) = tokio::sync::mpsc::unbounded_channel::<ParsedBatch>();
+    let (d_tx, d_rx) = tokio::sync::mpsc::unbounded_channel::<ParsedBatch>();
     // multi worker dynamic type parser
-    let parser = start_parser(Arc::clone(&conf), rx, d_tx)?;
+    let parser = start_parser(Arc::clone(&conf), Arc::clone(&cancel_token), rx, d_tx)?;
     // demultiplexer
+
+    let consumers = Consumers::load_shared()?;
+    Consumers::start_hot_reload(consumers.clone()).await?;
+    let demultiplexer = start_demultiplexer(
+        Arc::clone(&conf),
+        Arc::clone(&cancel_token),
+        d_rx,
+        consumers,
+    )
+    .await?;
 
     wait_for_shutdown().await;
     cancel_token.cancel();
     listener.wait().await;
     parser.wait().await;
+    demultiplexer.wait().await;
 
     Ok(())
 }

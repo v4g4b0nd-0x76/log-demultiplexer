@@ -9,6 +9,7 @@ use log_demultiplexer::{
     parser::{Parser, start_parser},
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio_util::sync::CancellationToken;
 
 const BATCH_LEN: usize = 256;
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
@@ -31,7 +32,8 @@ impl ParserBenchHarness {
         });
         let (input_tx, input_rx) = mpsc::unbounded_channel::<Arc<[u8]>>();
         let (output_tx, output_rx) = mpsc::unbounded_channel::<ParsedBatch>();
-        let parser = start_parser(conf, input_rx, output_tx).unwrap();
+        let cancel_token = CancellationToken::new();
+        let parser = start_parser(conf, Arc::new(cancel_token), input_rx, output_tx).unwrap();
 
         Self {
             input_tx,

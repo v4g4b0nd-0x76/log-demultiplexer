@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
+use log_demultiplexer::conf::ParsedBatch;
 use tokio_util::sync::CancellationToken;
 
 use log_demultiplexer::MultiplexerError;
+use log_demultiplexer::parser::start_parser;
 use log_demultiplexer::udp_listener::start_udp_listener;
-
 #[tokio::main]
 async fn main() -> Result<(), MultiplexerError> {
     let conf = Arc::new(
@@ -14,7 +15,8 @@ async fn main() -> Result<(), MultiplexerError> {
     );
     let cancel_token = Arc::new(CancellationToken::new());
 
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Arc<[u8]>>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Arc<[u8]>>();
+    // multi worker connection acceptor
     let listener = start_udp_listener(
         Arc::clone(&conf),
         Arc::clone(&cancel_token),
@@ -22,14 +24,15 @@ async fn main() -> Result<(), MultiplexerError> {
         conf.as_ref().port,
     )?;
 
-    // multi worker connection acceptor
-    // sharded raw fixed size manually allocated ring buffer
-    // parser which parse data into shared pointer
+    let (d_tx, _d_rx) = tokio::sync::mpsc::unbounded_channel::<ParsedBatch>();
+    // multi worker dynamic type parser
+    let parser = start_parser(Arc::clone(&conf), rx, d_tx)?;
     // demultiplexer
 
     wait_for_shutdown().await;
     cancel_token.cancel();
     listener.wait().await;
+    parser.wait().await;
 
     Ok(())
 }

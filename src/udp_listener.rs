@@ -79,6 +79,8 @@ mod tests {
             conn_workers: workers,
             udp_buffer_size: 1024,
             port: 5402,
+            parse_batch_thresh: 1000,
+            parse_type: crate::conf::ParseType::Str,
         })
     }
 

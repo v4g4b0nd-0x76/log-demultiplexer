@@ -1,6 +1,6 @@
 pub mod conf;
+pub mod parser;
 pub mod udp_listener;
-
 use std::fmt::Debug;
 
 pub enum MultiplexerError {

@@ -1,11 +1,13 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use log_demultiplexer::conf::Config;
+use log_demultiplexer::conf::{Config, ParseType};
 use log_demultiplexer::udp_listener::start_udp_listener;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const PAYLOAD_SIZES: &[usize] = &[64, 512, 1024, 8192];
+const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Start listener on `port`, send one datagram of `payload`, drain it.
 async fn send_and_drain_one(port: usize, payload: &[u8]) {
@@ -13,6 +15,8 @@ async fn send_and_drain_one(port: usize, payload: &[u8]) {
         conn_workers: 1,
         udp_buffer_size: 65_535,
         port: 5403,
+        parse_batch_thresh: 1000,
+        parse_type: ParseType::Str,
     });
     let cancel = Arc::new(CancellationToken::new());
     let (tx, mut rx) = mpsc::unbounded_channel::<Arc<[u8]>>();
@@ -25,7 +29,7 @@ async fn send_and_drain_one(port: usize, payload: &[u8]) {
         .await
         .unwrap();
 
-    tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+    tokio::time::timeout(RECV_TIMEOUT, rx.recv())
         .await
         .expect("bench recv timeout")
         .unwrap();
@@ -40,6 +44,8 @@ async fn send_and_drain_many(port: usize, payload: &[u8], workers: usize, count:
         conn_workers: workers,
         udp_buffer_size: 65_535,
         port: 5403,
+        parse_batch_thresh: 1000,
+        parse_type: ParseType::Str,
     });
     let cancel = Arc::new(CancellationToken::new());
     let (tx, mut rx) = mpsc::unbounded_channel::<Arc<[u8]>>();
@@ -48,14 +54,21 @@ async fn send_and_drain_many(port: usize, payload: &[u8], workers: usize, count:
 
     let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let dst = format!("127.0.0.1:{port}");
-    for _ in 0..count {
-        sender.send_to(payload, &dst).await.unwrap();
-    }
-    for _ in 0..count {
-        tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+    let max_in_flight = workers.max(1) * 8;
+    let mut sent = 0;
+    let mut received = 0;
+
+    while received < count {
+        while sent < count && sent - received < max_in_flight {
+            sender.send_to(payload, &dst).await.unwrap();
+            sent += 1;
+        }
+
+        tokio::time::timeout(RECV_TIMEOUT, rx.recv())
             .await
             .expect("bench recv timeout")
             .unwrap();
+        received += 1;
     }
 
     cancel.cancel();

@@ -7,6 +7,14 @@ use std::{
     time::Duration,
 };
 
+use bb8::Pool;
+use bb8_redis::{RedisConnectionManager, redis};
+use elasticsearch::{
+    Elasticsearch,
+    auth::Credentials,
+    cert::CertificateValidation,
+    http::transport::{self, SingleNodeConnectionPool, Transport, TransportBuilder},
+};
 use tokio::{
     sync::{
         RwLock,
@@ -16,6 +24,8 @@ use tokio::{
     time::MissedTickBehavior,
 };
 use tokio_util::sync::CancellationToken;
+use url::Url;
+use urlencoding::encode;
 
 use crate::{
     MultiplexerError,
@@ -237,11 +247,15 @@ fn spawn_consumer_runtime(
 ) -> ConsumerRuntime {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Arc<ParsedBatch>>();
     let stop_token = cancel_token.child_token();
+    let consumer = Arc::new(consumer);
+    let consumer_type = Arc::new(consumer.consumer_type.clone());
 
     let worker_token = stop_token.clone();
     let worker_key = consumer_key.clone();
     let worker_metrics = Arc::clone(&metrics);
     let worker_observer = observer.clone();
+    let worker_consumer = Arc::clone(&consumer);
+    let worker_consumer_type = Arc::clone(&consumer_type);
     let worker = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -259,30 +273,32 @@ fn spawn_consumer_runtime(
                         });
                     }
 
-                    // Actual Redis / Elasticsearch delivery comes later; for now we keep
-                    // the worker topology and simply drain the shared batch without copying it.
-                    let _ = batch;
+                    match worker_consumer_type.as_ref() {
+                        crate::consumers::ConsumerType::Elastic => index_elastic_batch(&worker_consumer, batch).await.is_ok(),
+                        crate::consumers::ConsumerType::Redis => push_redis_batch(&worker_consumer, batch).await.is_ok(),
+                    };
                 }
             }
         }
     });
 
     let healthcheck_token = stop_token.clone();
-    let consumer_type = consumer.consumer_type.clone();
     let healthcheck_key = consumer_key.clone();
+    let healthcheck_consumer = Arc::clone(&consumer);
+    let healthcheck_consumer_type = Arc::clone(&consumer_type);
     let healthcheck = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(options.healthcheck_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut consecutive_failures = 0u8;
-       
+
         loop {
             tokio::select! {
                 biased;
                 _ = healthcheck_token.cancelled() => break,
                 _ = ticker.tick() => {
-                    let healthy= match consumer.consumer_type {
-                        crate::consumers::ConsumerType::Elastic => elastic_health_check(&consumer).await.is_ok(),
-                        crate::consumers::ConsumerType::Redis => redis_health_check(&consumer).await.is_ok(),
+                    let healthy = match healthcheck_consumer_type.as_ref() {
+                        crate::consumers::ConsumerType::Elastic => elastic_health_check(&healthcheck_consumer).await.is_ok(),
+                        crate::consumers::ConsumerType::Redis => redis_health_check(&healthcheck_consumer).await.is_ok(),
                     };
                     if healthy {
                         consecutive_failures = 0;
@@ -292,7 +308,7 @@ fn spawn_consumer_runtime(
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     if consecutive_failures > 3 {
                         eprintln!(
-                            "consumer worker {healthcheck_key} ({consumer_type:?}) failed healthchecks; pausing for {:?}",
+                            "consumer worker {healthcheck_key} ({healthcheck_consumer_type:?}) failed healthchecks; pausing for {:?}",
                             options.healthcheck_backoff
                         );
                         tokio::time::sleep(options.healthcheck_backoff).await;
@@ -330,13 +346,159 @@ fn consumer_key(consumer: &Consumer) -> String {
     )
 }
 
-// TODO: implement health checks
-async fn elastic_health_check(consumer : &Consumer) -> Result<bool , MultiplexerError> {
-    Ok(true)
+async fn elastic_health_check(consumer: &Consumer) -> Result<bool, MultiplexerError> {
+    let client = create_elastic_client(consumer)?;
+    let res = client
+        .ping()
+        .send()
+        .await
+        .map_err(|e| MultiplexerError::ElasticClient(e.to_string()))?;
+
+    match res.status_code().as_u16() {
+        200 | 403 => Ok(true),
+        code => Err(MultiplexerError::ElasticClient(format!(
+            "ping unexpected status code: {}",
+            code
+        ))),
+    }
 }
 
-async fn redis_health_check(consumer : &Consumer) -> Result<bool , MultiplexerError> {
-    Ok(true)
+async fn index_elastic_batch(
+    consumer: &Consumer,
+    batch: Arc<ParsedBatch>,
+) -> Result<(), MultiplexerError> {
+    let client = create_elastic_client(consumer)?;
+
+    let index = match &consumer.target_name {
+        Some(name) => format!("{}-{}", name, chrono::Utc::now().format("%Y.%m.%d")),
+        None => return Err(MultiplexerError::ElasticClient("no target_name".into())),
+    };
+
+    let body: Vec<elasticsearch::BulkOperation<serde_json::Value>> = match batch.as_ref() {
+        ParsedBatch::Str(items) => items
+            .iter()
+            .map(|item| {
+                let doc = serde_json::from_str(item)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": item }));
+                elasticsearch::BulkOperation::index(doc).into()
+            })
+            .collect(),
+        ParsedBatch::Json(items) => items
+            .iter()
+            .map(|doc| elasticsearch::BulkOperation::index(doc.clone()).into())
+            .collect(),
+    };
+
+    client
+        .bulk(elasticsearch::BulkParts::Index(&index))
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| MultiplexerError::ElasticClient(e.to_string()))?;
+
+    Ok(())
+}
+
+
+async fn push_redis_batch(
+    consumer: &Consumer,
+    batch: Arc<ParsedBatch>,
+) -> Result<(), MultiplexerError> {
+    let url = match &consumer.password {
+        Some(pass) => format!("redis://:{}@{}", encode(pass), consumer.addr),
+        None => format!("redis://{}", consumer.addr),
+    };
+
+    let list = match &consumer.target_name {
+        Some(name) => format!("{}-{}", name, chrono::Utc::now().format("%Y.%m.%d")),
+        None => return Err(MultiplexerError::RedisClient("no target_name".into())),
+    };
+
+    let manager = RedisConnectionManager::new(url)
+        .map_err(|e| MultiplexerError::RedisClient(e.to_string()))?;
+
+    let pool = Pool::builder()
+        .max_size(8)
+        .connection_timeout(Duration::from_secs(2))
+        .build(manager)
+        .await
+        .map_err(|e| MultiplexerError::RedisClient(e.to_string()))?;
+
+    let values: Vec<Vec<u8>> = match batch.as_ref() {
+        ParsedBatch::Str(items) => items.iter().map(|s| s.as_bytes().to_vec()).collect(),
+        ParsedBatch::Json(items) => items.iter().map(|v| v.to_string().into_bytes()).collect(),
+    };
+
+    let chunks: Vec<&[Vec<u8>]> = values.chunks(10_000).collect();
+
+    let tasks: Vec<_> = chunks
+        .into_iter()
+        .map(|chunk| {
+            let pool = pool.clone();
+            let list = list.clone();
+            let chunk = chunk.to_vec();
+            tokio::spawn(async move {
+                let mut conn = pool.get().await.map_err(|e| MultiplexerError::RedisClient(e.to_string()))?;
+                redis::cmd("RPUSH")
+                    .arg(&list)
+                    .arg(chunk)
+                    .query_async::<()>(&mut *conn)
+                    .await
+                    .map_err(|e| MultiplexerError::RedisClient(e.to_string()))
+            })
+        })
+        .collect();
+
+    for task in tasks {
+        task.await.map_err(|e| MultiplexerError::RedisClient(e.to_string()))??;
+    }
+
+    Ok(())
+}
+
+fn create_elastic_client(consumer: &Consumer) -> Result<Elasticsearch, MultiplexerError> {
+    let url =
+        Url::parse(&consumer.addr).map_err(|e| MultiplexerError::ElasticClient(e.to_string()))?;
+
+    let transport = match (&consumer.username, &consumer.password) {
+        (Some(user), Some(pass)) => TransportBuilder::new(SingleNodeConnectionPool::new(url))
+            .auth(Credentials::Basic(user.clone(), pass.clone()))
+            .cert_validation(CertificateValidation::None)
+            .build(),
+        _ => TransportBuilder::new(SingleNodeConnectionPool::new(url))
+            .cert_validation(CertificateValidation::None)
+            .build(),
+    }
+    .map_err(|e| MultiplexerError::ElasticClient(e.to_string()))?;
+
+    Ok(Elasticsearch::new(transport))
+}
+async fn redis_health_check(consumer: &Consumer) -> Result<bool, MultiplexerError> {
+    let url = match &consumer.password {
+        Some(pass) => format!("redis://:{}@{}", encode(pass), consumer.addr),
+        None => format!("redis://{}", consumer.addr),
+    };
+
+    let client =
+        redis::Client::open(url).map_err(|e| MultiplexerError::RedisClient(e.to_string()))?;
+
+    let mut conn: redis::aio::MultiplexedConnection = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.get_multiplexed_async_connection(),
+    )
+    .await
+    .map_err(|_| MultiplexerError::RedisClient("connection timed out".into()))?
+    .map_err(|e| MultiplexerError::RedisClient(e.to_string()))?;
+
+    let pong: String = tokio::time::timeout(
+        Duration::from_secs(2),
+        redis::cmd("PING").query_async(&mut conn),
+    )
+    .await
+    .map_err(|_| MultiplexerError::RedisClient("ping timed out".into()))?
+    .map_err(|e| MultiplexerError::RedisClient(e.to_string()))?;
+
+    Ok(pong == "PONG")
 }
 
 #[cfg(test)]

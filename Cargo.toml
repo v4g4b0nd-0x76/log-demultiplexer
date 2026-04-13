@@ -32,6 +32,13 @@ simd-json = { version = "0.17.0", features = ["serde"] }
 tokio = { version = "1.51.1", features = ["full"] }
 tokio-util = "0.7.18"
 toml = "1.1.2"
+bb8 = "0.9.1"
+bb8-redis = "0.26.0"
+elasticsearch = "9.1.0-alpha.1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "http2", "gzip"], default-features = false }
+url = "2.5.8"
+urlencoding = "2.1.3"
+chrono = { version = "0.4.44", features = ["clock"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }

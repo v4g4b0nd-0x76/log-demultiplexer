@@ -11,6 +11,8 @@ pub enum MultiplexerError {
     LoadConfig(conf::ConfError),
     SpawnWorker((usize, String)),
     LoadConsumers(String),
+    ElasticClient(String),
+    RedisClient(String),
 }
 
 impl Debug for MultiplexerError {
@@ -27,6 +29,8 @@ impl Debug for MultiplexerError {
                 write!(f, "failed to spawn worker {}: {}", worker, err)
             }
             MultiplexerError::LoadConsumers(err) => write!(f, "failed to load consumers: {}", err),
+            MultiplexerError::ElasticClient(err) => write!(f , "elastic failed: {}" , err),
+            MultiplexerError::RedisClient(err) => write!(f , "redis failed: {}" , err),
         }
     }
 }

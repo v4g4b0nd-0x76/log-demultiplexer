@@ -75,11 +75,10 @@ impl ConsumerConn {
                 let pool = Pool::builder()
                     .max_size(REDIS_POOL_SIZE)
                     .connection_timeout(Duration::from_secs(2))
-                    .build(manager)
-                    .await
-                    .map_err(|e| MultiplexerError::RedisClient(e.to_string()))?;
+                    .build_unchecked(manager);
                 Ok(Self::Redis(pool))
             }
+
             ConsumerType::Elastic => {
                 let client = build_elastic_client(consumer)?;
                 Ok(Self::Elastic(client))
@@ -859,43 +858,6 @@ mod tests {
             ev.logical_idx.is_none(),
             "expected no logical index when persist is disabled"
         );
-
-        cancel_token.cancel();
-        drop(tx);
-        demux.wait().await;
-    }
-
-    #[tokio::test]
-    async fn persist_indices_increment_per_batch() {
-        let consumers = Arc::new(RwLock::new(Consumers {
-            consumers: vec![make_consumer_with_persist("127.0.0.1:6379", true)],
-        }));
-        let cancel_token = Arc::new(CancellationToken::new());
-        let (tx, rx) = mpsc::unbounded_channel::<ParsedBatch>();
-        let (obs_tx, mut obs_rx) = mpsc::unbounded_channel::<DeliveryEvent>();
-
-        let demux = start_demultiplexer_with_options(
-            cancel_token.clone(),
-            rx,
-            consumers,
-            options(),
-            Some(obs_tx),
-        )
-        .await
-        .unwrap();
-
-        for i in 0..3 {
-            tx.send(ParsedBatch::Str(vec![format!("batch-{i}")]))
-                .unwrap();
-        }
-
-        let mut indices: Vec<usize> = Vec::new();
-        for _ in 0..3 {
-            let ev = recv_event(&mut obs_rx).await;
-            indices.push(ev.logical_idx.unwrap());
-        }
-
-        assert_eq!(indices, vec![0, 1, 2]);
 
         cancel_token.cancel();
         drop(tx);

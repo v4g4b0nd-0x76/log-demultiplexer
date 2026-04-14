@@ -250,8 +250,9 @@ where
 }
 
 pub struct ConsumerPersistBuffer {
-    ring: RingBuffer<Arc<ParsedBatch>>,
+    ring: RingBuffer<(usize, Arc<ParsedBatch>)>,
     persist_dir: PathBuf,
+    next_id: usize,
 }
 
 impl ConsumerPersistBuffer {
@@ -260,43 +261,57 @@ impl ConsumerPersistBuffer {
         Self {
             ring: RingBuffer::new(max_batch),
             persist_dir,
+            next_id: 0,
         }
     }
 
-    pub fn new(consumer_key: &str, max_batch: usize) -> Self {
-        Self::new_inner(consumer_key, max_batch)
+    pub fn new_in(consumer_key: &str, max_batch: usize, base: &std::path::Path) -> Self {
+        let persist_dir = base.join(sanitize_key(consumer_key));
+        Self {
+            ring: RingBuffer::new(max_batch),
+            persist_dir,
+            next_id: 0,
+        }
     }
 
     pub fn persist_and_push(&mut self, batch: Arc<ParsedBatch>) -> std::io::Result<usize> {
         fs::create_dir_all(&self.persist_dir)?;
 
-        let next_logical = if self.ring.len == self.ring.cap {
-            let evicted_path = self.entry_path(self.ring.head);
-            let _ = fs::remove_file(&evicted_path);
-            self.ring.head
-        } else {
-            self.ring.len
-        };
+        if self.ring.len == self.ring.cap {
+            if let Some((evicted_id, _)) = self.ring.get(0) {
+                let _ = fs::remove_file(self.entry_path(*evicted_id));
+            }
+        }
 
-        let path = self.persist_dir.join(format!("{}.bin", next_logical));
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let path = self.entry_path(id);
         let cfg = bincode::config::standard();
         let bytes = bincode::serde::encode_to_vec(batch.as_ref(), cfg)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         fs::write(&path, bytes)?;
 
-        let phys = self.ring.push(Arc::clone(&batch));
-        Ok(phys)
+        self.ring.push((id, Arc::clone(&batch)));
+        Ok(id)
     }
 
-    pub fn confirm_delivered(&mut self, logical_idx: usize) {
-        let _ = fs::remove_file(self.entry_path(logical_idx));
-        self.ring.remove(logical_idx);
+    pub fn confirm_delivered(&mut self, id: usize) {
+        let logical = self
+            .ring
+            .iter_ordered()
+            .find(|(_, (rid, _))| *rid == id)
+            .map(|(i, _)| i);
+        if let Some(logical_idx) = logical {
+            let _ = fs::remove_file(self.entry_path(id));
+            self.ring.remove(logical_idx);
+        }
     }
 
     pub fn replay_all(&self) -> Vec<(usize, Arc<ParsedBatch>)> {
         self.ring
             .iter_ordered()
-            .map(|(i, b)| (i, Arc::clone(b)))
+            .map(|(_, (id, b))| (*id, Arc::clone(b)))
             .collect()
     }
 
@@ -311,33 +326,28 @@ impl ConsumerPersistBuffer {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
         let cfg = bincode::config::standard();
-        let owned: Vec<&ParsedBatch> = self.ring.iter_ordered().map(|(_, b)| b.as_ref()).collect();
+        let owned: Vec<&ParsedBatch> = self
+            .ring
+            .iter_ordered()
+            .map(|(_, (_, b))| b.as_ref())
+            .collect();
         let bytes = bincode::serde::encode_to_vec(&owned, cfg)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         fs::write(PathBuf::from(base_dir).join(format!("{}.bin", key)), bytes)
     }
 
-    fn entry_path(&self, slot: usize) -> PathBuf {
-        self.persist_dir.join(format!("{}.bin", slot))
-    }
-
-    pub fn new_in(consumer_key: &str, max_batch: usize, base: &std::path::Path) -> Self {
-        let persist_dir = base.join(sanitize_key(consumer_key));
-        Self {
-            ring: RingBuffer::new(max_batch),
-            persist_dir,
-        }
+    fn entry_path(&self, id: usize) -> PathBuf {
+        self.persist_dir.join(format!("{}.bin", id))
     }
 
     pub fn persist_dir(&self) -> &std::path::Path {
         &self.persist_dir
     }
 
-    pub fn entry_path_pub(&self, slot: usize) -> std::path::PathBuf {
-        self.entry_path(slot)
+    pub fn entry_path_pub(&self, id: usize) -> PathBuf {
+        self.entry_path(id)
     }
 }
-
 pub fn load_consumer_buffer_in(
     consumer_key: &str,
     max_batch: usize,
@@ -347,39 +357,6 @@ pub fn load_consumer_buffer_in(
     if !buf.persist_dir.exists() {
         return buf;
     }
-    let mut entries: Vec<(usize, std::path::PathBuf)> = std::fs::read_dir(&buf.persist_dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |x| x == "bin"))
-        .filter_map(|e| {
-            let path = e.path();
-            let idx = path.file_stem()?.to_str()?.parse::<usize>().ok()?;
-            Some((idx, path))
-        })
-        .collect();
-    entries.sort_by_key(|(idx, _)| *idx);
-    let loaded: Vec<ParsedBatch> = entries
-        .par_iter()
-        .filter_map(|(_, path)| {
-            let bytes = std::fs::read(path).ok()?;
-            let (batch, _): (ParsedBatch, _) =
-                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).ok()?;
-            Some(batch)
-        })
-        .collect();
-    for batch in loaded {
-        buf.ring.push(Arc::new(batch));
-    }
-    buf
-}
-pub fn load_consumer_buffer(consumer_key: &str, max_batch: usize) -> ConsumerPersistBuffer {
-    let mut buf = ConsumerPersistBuffer::new_inner(consumer_key, max_batch);
-
-    if !buf.persist_dir.exists() {
-        return buf;
-    }
-
     let mut entries: Vec<(usize, PathBuf)> = fs::read_dir(&buf.persist_dir)
         .into_iter()
         .flatten()
@@ -391,7 +368,46 @@ pub fn load_consumer_buffer(consumer_key: &str, max_batch: usize) -> ConsumerPer
             Some((idx, path))
         })
         .collect();
+    entries.sort_by_key(|(idx, _)| *idx);
 
+    let loaded: Vec<(usize, ParsedBatch)> = entries
+        .par_iter()
+        .filter_map(|(idx, path)| {
+            let bytes = fs::read(path).ok()?;
+            let (batch, _): (ParsedBatch, _) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).ok()?;
+            Some((*idx, batch))
+        })
+        .collect();
+
+    let mut loaded = loaded;
+    loaded.sort_by_key(|(idx, _)| *idx);
+
+    let max_id = loaded.last().map(|(idx, _)| *idx).unwrap_or(0);
+    buf.next_id = max_id + 1;
+
+    for (id, batch) in loaded {
+        buf.ring.push((id, Arc::new(batch)));
+    }
+    buf
+}
+
+pub fn load_consumer_buffer(consumer_key: &str, max_batch: usize) -> ConsumerPersistBuffer {
+    let mut buf = ConsumerPersistBuffer::new_inner(consumer_key, max_batch);
+    if !buf.persist_dir.exists() {
+        return buf;
+    }
+    let mut entries: Vec<(usize, PathBuf)> = fs::read_dir(&buf.persist_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |x| x == "bin"))
+        .filter_map(|e| {
+            let path = e.path();
+            let idx = path.file_stem()?.to_str()?.parse::<usize>().ok()?;
+            Some((idx, path))
+        })
+        .collect();
     entries.sort_by_key(|(idx, _)| *idx);
 
     let loaded: Vec<(usize, ParsedBatch)> = entries
@@ -405,10 +421,15 @@ pub fn load_consumer_buffer(consumer_key: &str, max_batch: usize) -> ConsumerPer
         })
         .collect();
 
-    for (_, batch) in loaded {
-        buf.ring.push(Arc::new(batch));
-    }
+    let mut loaded = loaded;
+    loaded.sort_by_key(|(idx, _)| *idx);
 
+    let max_id = loaded.last().map(|(idx, _)| *idx).unwrap_or(0);
+    buf.next_id = max_id + 1;
+
+    for (id, batch) in loaded {
+        buf.ring.push((id, Arc::new(batch)));
+    }
     buf
 }
 

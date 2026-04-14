@@ -18,7 +18,7 @@ use elasticsearch::{
 };
 use tokio::{
     sync::{
-        RwLock,
+        Mutex, RwLock,
         mpsc::{UnboundedReceiver, UnboundedSender},
     },
     task::JoinHandle,
@@ -32,6 +32,7 @@ use crate::{
     MultiplexerError,
     conf::{Config, ParsedBatch},
     consumers::{Consumer, ConsumerType, Consumers},
+    persist::{ConsumerPersistBuffer, load_consumer_buffer},
 };
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
@@ -39,10 +40,6 @@ const HEALTHCHECK_INTERVAL: Duration = Duration::from_secs(5);
 const HEALTHCHECK_BACKOFF: Duration = Duration::from_secs(30);
 const REDIS_CHUNK_SIZE: usize = 10_000;
 const REDIS_POOL_SIZE: u32 = 8;
-
-
-
-
 
 #[derive(Default)]
 pub struct DemultiplexerMetrics {
@@ -52,14 +49,16 @@ pub struct DemultiplexerMetrics {
 }
 
 impl DemultiplexerMetrics {
-    pub fn input_batches(&self) -> u64 { self.input_batches.load(Ordering::Relaxed) }
-    pub fn deliveries(&self) -> u64 { self.deliveries.load(Ordering::Relaxed) }
-    pub fn active_workers(&self) -> usize { self.active_workers.load(Ordering::Relaxed) }
+    pub fn input_batches(&self) -> u64 {
+        self.input_batches.load(Ordering::Relaxed)
+    }
+    pub fn deliveries(&self) -> u64 {
+        self.deliveries.load(Ordering::Relaxed)
+    }
+    pub fn active_workers(&self) -> usize {
+        self.active_workers.load(Ordering::Relaxed)
+    }
 }
-
-
-
-
 
 enum ConsumerConn {
     Redis(Pool<RedisConnectionManager>),
@@ -89,18 +88,18 @@ impl ConsumerConn {
     }
 }
 
-
-
-
-
 pub struct Demultiplexer {
     manager: JoinHandle<()>,
     metrics: Arc<DemultiplexerMetrics>,
 }
 
 impl Demultiplexer {
-    pub async fn wait(self) { let _ = self.manager.await; }
-    pub fn metrics(&self) -> Arc<DemultiplexerMetrics> { Arc::clone(&self.metrics) }
+    pub async fn wait(self) {
+        let _ = self.manager.await;
+    }
+    pub fn metrics(&self) -> Arc<DemultiplexerMetrics> {
+        Arc::clone(&self.metrics)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -125,18 +124,16 @@ impl Default for RuntimeOptions {
 struct DeliveryEvent {
     consumer_key: String,
     batch: Arc<ParsedBatch>,
+    logical_idx: Option<usize>,
 }
 
 struct ConsumerRuntime {
-    tx: UnboundedSender<Arc<ParsedBatch>>,
+    tx: UnboundedSender<(Arc<ParsedBatch>, Option<usize>)>,
     stop_token: CancellationToken,
     worker: JoinHandle<()>,
     healthcheck: JoinHandle<()>,
+    persist_buf: Option<Arc<Mutex<ConsumerPersistBuffer>>>,
 }
-
-
-
-
 
 pub async fn start_demultiplexer(
     _conf: Arc<Config>,
@@ -159,15 +156,19 @@ async fn start_demultiplexer_with_options(
     let manager_metrics = Arc::clone(&metrics);
 
     let manager = tokio::spawn(async move {
-        run_manager(cancel_token, rx, consumers, options, observer, manager_metrics).await;
+        run_manager(
+            cancel_token,
+            rx,
+            consumers,
+            options,
+            observer,
+            manager_metrics,
+        )
+        .await;
     });
 
     Ok(Demultiplexer { manager, metrics })
 }
-
-
-
-
 
 async fn run_manager(
     cancel_token: Arc<CancellationToken>,
@@ -182,7 +183,15 @@ async fn run_manager(
     reconcile_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     let snapshot = consumers.read().await.clone();
-    reconcile_consumers(&snapshot, &cancel_token, &mut runtimes, &metrics, options, observer.clone()).await;
+    reconcile_consumers(
+        &snapshot,
+        &cancel_token,
+        &mut runtimes,
+        &metrics,
+        options,
+        observer.clone(),
+    )
+    .await;
 
     loop {
         tokio::select! {
@@ -196,7 +205,7 @@ async fn run_manager(
                 let Some(batch) = batch else { break };
                 metrics.input_batches.fetch_add(1, Ordering::Relaxed);
                 let shared = Arc::new(batch);
-                let dead = dispatch_batch(&runtimes, shared);
+                let dead = dispatch_batch(&mut runtimes, shared).await;
                 for key in dead {
                     if let Some(rt) = runtimes.remove(&key) {
                         stop_runtime(rt, &metrics).await;
@@ -210,10 +219,6 @@ async fn run_manager(
         stop_runtime(rt, &metrics).await;
     }
 }
-
-
-
-
 
 async fn reconcile_consumers(
     consumers: &Consumers,
@@ -233,7 +238,16 @@ async fn reconcile_consumers(
             continue;
         }
 
-        match spawn_consumer_runtime(key.clone(), consumer.clone(), cancel_token, Arc::clone(metrics), options, observer.clone()).await {
+        match spawn_consumer_runtime(
+            key.clone(),
+            consumer.clone(),
+            cancel_token,
+            Arc::clone(metrics),
+            options,
+            observer.clone(),
+        )
+        .await
+        {
             Ok(runtime) => {
                 metrics.active_workers.fetch_add(1, Ordering::Relaxed);
                 runtimes.insert(key, runtime);
@@ -244,17 +258,17 @@ async fn reconcile_consumers(
         }
     }
 
-    let stale: Vec<_> = runtimes.keys().filter(|k| !desired.contains(*k)).cloned().collect();
+    let stale: Vec<_> = runtimes
+        .keys()
+        .filter(|k| !desired.contains(*k))
+        .cloned()
+        .collect();
     for key in stale {
         if let Some(rt) = runtimes.remove(&key) {
             stop_runtime(rt, metrics).await;
         }
     }
 }
-
-
-
-
 
 async fn spawn_consumer_runtime(
     consumer_key: String,
@@ -264,14 +278,26 @@ async fn spawn_consumer_runtime(
     options: RuntimeOptions,
     observer: Option<UnboundedSender<DeliveryEvent>>,
 ) -> Result<ConsumerRuntime, MultiplexerError> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Arc<ParsedBatch>>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Arc<ParsedBatch>, Option<usize>)>();
     let stop_token = cancel_token.child_token();
 
-    
     let conn = Arc::new(ConsumerConn::build(&consumer).await?);
     let consumer = Arc::new(consumer);
 
-    
+    let persist_buf: Option<Arc<Mutex<ConsumerPersistBuffer>>> = if consumer.persist.enable {
+        let buf = load_consumer_buffer(&consumer_key, consumer.persist.max_batch);
+        Some(Arc::new(Mutex::new(buf)))
+    } else {
+        None
+    };
+
+    if let Some(buf) = &persist_buf {
+        let replays = buf.lock().await.replay_all();
+        for (logical_idx, batch) in replays {
+            let _ = tx.send((batch, Some(logical_idx)));
+        }
+    }
+
     let worker = {
         let conn = Arc::clone(&conn);
         let consumer = Arc::clone(&consumer);
@@ -279,24 +305,34 @@ async fn spawn_consumer_runtime(
         let key = consumer_key.clone();
         let metrics = Arc::clone(&metrics);
         let observer = observer.clone();
+        let persist_buf = persist_buf.clone();
 
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => break,
-                    batch = rx.recv() => {
-                        let Some(batch) = batch else { break };
+                    msg = rx.recv() => {
+                        let Some((batch, logical_idx)) = msg else { break };
                         metrics.deliveries.fetch_add(1, Ordering::Relaxed);
                         if let Some(obs) = observer.as_ref() {
-                            let _ = obs.send(DeliveryEvent { consumer_key: key.clone(), batch: Arc::clone(&batch) });
+                            let _ = obs.send(DeliveryEvent {
+                                consumer_key: key.clone(),
+                                batch: Arc::clone(&batch),
+                                logical_idx,
+                            });
                         }
                         let result = match conn.as_ref() {
-                            ConsumerConn::Elastic(client) => index_elastic_batch(client, &consumer, batch).await,
-                            ConsumerConn::Redis(pool) => push_redis_batch(pool, &consumer, batch).await,
+                            ConsumerConn::Elastic(client) => index_elastic_batch(client, &consumer, Arc::clone(&batch)).await,
+                            ConsumerConn::Redis(pool) => push_redis_batch(pool, &consumer, Arc::clone(&batch)).await,
                         };
-                        if let Err(e) = result {
-                            eprintln!("delivery error on {key}: {e}");
+                        match result {
+                            Ok(()) => {
+                                if let (Some(buf), Some(idx)) = (&persist_buf, logical_idx) {
+                                    buf.lock().await.confirm_delivered(idx);
+                                }
+                            }
+                            Err(e) => eprintln!("delivery error on {key}: {e}"),
                         }
                     }
                 }
@@ -304,7 +340,6 @@ async fn spawn_consumer_runtime(
         })
     };
 
-    
     let healthcheck = {
         let conn = Arc::clone(&conn);
         let consumer = Arc::clone(&consumer);
@@ -346,7 +381,13 @@ async fn spawn_consumer_runtime(
         })
     };
 
-    Ok(ConsumerRuntime { tx, stop_token, worker, healthcheck })
+    Ok(ConsumerRuntime {
+        tx,
+        stop_token,
+        worker,
+        healthcheck,
+        persist_buf,
+    })
 }
 
 async fn stop_runtime(runtime: ConsumerRuntime, metrics: &DemultiplexerMetrics) {
@@ -357,23 +398,30 @@ async fn stop_runtime(runtime: ConsumerRuntime, metrics: &DemultiplexerMetrics) 
     metrics.active_workers.fetch_sub(1, Ordering::Relaxed);
 }
 
-
-
-
-
-fn dispatch_batch(runtimes: &HashMap<String, ConsumerRuntime>, batch: Arc<ParsedBatch>) -> Vec<String> {
+async fn dispatch_batch(
+    runtimes: &mut HashMap<String, ConsumerRuntime>,
+    batch: Arc<ParsedBatch>,
+) -> Vec<String> {
     let mut dead = Vec::new();
-    for (key, rt) in runtimes {
-        if rt.tx.send(Arc::clone(&batch)).is_err() {
+    for (key, rt) in runtimes.iter_mut() {
+        let payload = if let Some(buf) = &rt.persist_buf {
+            match buf.lock().await.persist_and_push(Arc::clone(&batch)) {
+                Ok(idx) => (Arc::clone(&batch), Some(idx)),
+                Err(e) => {
+                    eprintln!("persist error for {key}: {e}");
+                    (Arc::clone(&batch), None)
+                }
+            }
+        } else {
+            (Arc::clone(&batch), None)
+        };
+
+        if rt.tx.send(payload).is_err() {
             dead.push(key.clone());
         }
     }
     dead
 }
-
-
-
-
 
 async fn index_elastic_batch(
     client: &Elasticsearch,
@@ -383,11 +431,16 @@ async fn index_elastic_batch(
     let index = target_list_name(consumer)?;
 
     let body: Vec<elasticsearch::BulkOperation<serde_json::Value>> = match batch.as_ref() {
-        ParsedBatch::Str(items) => items.iter().map(|s| {
-            let doc = serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({ "raw": s }));
-            elasticsearch::BulkOperation::index(doc).into()
-        }).collect(),
-        ParsedBatch::Json(items) => items.iter()
+        ParsedBatch::Str(items) => items
+            .iter()
+            .map(|s| {
+                let doc =
+                    serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({ "raw": s }));
+                elasticsearch::BulkOperation::index(doc).into()
+            })
+            .collect(),
+        ParsedBatch::Json(items) => items
+            .iter()
             .map(|v| elasticsearch::BulkOperation::index(v.clone()).into())
             .collect(),
     };
@@ -421,7 +474,9 @@ async fn push_redis_batch(
             let list = list.clone();
             let chunk = chunk.to_vec();
             tokio::spawn(async move {
-                let mut conn = pool.get().await
+                let mut conn = pool
+                    .get()
+                    .await
                     .map_err(|e| MultiplexerError::RedisClient(e.to_string()))?;
                 redis::cmd("RPUSH")
                     .arg(&list)
@@ -434,23 +489,25 @@ async fn push_redis_batch(
         .collect();
 
     for task in tasks {
-        task.await.map_err(|e| MultiplexerError::RedisClient(e.to_string()))??;
+        task.await
+            .map_err(|e| MultiplexerError::RedisClient(e.to_string()))??;
     }
 
     Ok(())
 }
 
-
-
-
-
 async fn elastic_health_check(client: &Elasticsearch) -> Result<(), MultiplexerError> {
-    let res = client.ping().send().await
+    let res = client
+        .ping()
+        .send()
+        .await
         .map_err(|e| MultiplexerError::ElasticClient(e.to_string()))?;
 
     match res.status_code().as_u16() {
         200 | 403 => Ok(()),
-        code => Err(MultiplexerError::ElasticClient(format!("unexpected ping status: {code}"))),
+        code => Err(MultiplexerError::ElasticClient(format!(
+            "unexpected ping status: {code}"
+        ))),
     }
 }
 
@@ -468,16 +525,18 @@ async fn redis_health_check(pool: &Pool<RedisConnectionManager>) -> Result<(), M
     .map_err(|_| MultiplexerError::RedisClient("ping timed out".into()))?
     .map_err(|e| MultiplexerError::RedisClient(e.to_string()))?;
 
-    if pong == "PONG" { Ok(()) } else { Err(MultiplexerError::RedisClient(format!("unexpected PING reply: {pong}"))) }
+    if pong == "PONG" {
+        Ok(())
+    } else {
+        Err(MultiplexerError::RedisClient(format!(
+            "unexpected PING reply: {pong}"
+        )))
+    }
 }
 
-
-
-
-
 fn build_elastic_client(consumer: &Consumer) -> Result<Elasticsearch, MultiplexerError> {
-    let url = Url::parse(&consumer.addr)
-        .map_err(|e| MultiplexerError::ElasticClient(e.to_string()))?;
+    let url =
+        Url::parse(&consumer.addr).map_err(|e| MultiplexerError::ElasticClient(e.to_string()))?;
 
     let builder = TransportBuilder::new(SingleNodeConnectionPool::new(url))
         .cert_validation(CertificateValidation::None);
@@ -501,8 +560,14 @@ fn redis_url(consumer: &Consumer) -> String {
 
 fn target_list_name(consumer: &Consumer) -> Result<String, MultiplexerError> {
     match &consumer.target_name {
-        Some(name) => Ok(format!("{}-{}", name, chrono::Utc::now().format("%Y.%m.%d"))),
-        None => Err(MultiplexerError::ElasticClient("no target_name configured".into())),
+        Some(name) => Ok(format!(
+            "{}-{}",
+            name,
+            chrono::Utc::now().format("%Y.%m.%d")
+        )),
+        None => Err(MultiplexerError::ElasticClient(
+            "no target_name configured".into(),
+        )),
     }
 }
 
@@ -517,17 +582,19 @@ fn consumer_key(consumer: &Consumer) -> String {
     )
 }
 
-
-
-
-
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
-    use tokio::sync::{RwLock, mpsc::{self, UnboundedReceiver}};
-    use tokio_util::sync::CancellationToken;
     use super::{DeliveryEvent, RuntimeOptions, consumer_key, start_demultiplexer_with_options};
-    use crate::{conf::ParsedBatch, consumers::{Consumer, ConsumerType, Consumers}};
+    use crate::{
+        conf::ParsedBatch,
+        consumers::{Consumer, ConsumerType, Consumers, PersistOption},
+    };
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::{
+        RwLock,
+        mpsc::{self, UnboundedReceiver},
+    };
+    use tokio_util::sync::CancellationToken;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
     const TEST_RECONCILE: Duration = Duration::from_millis(50);
@@ -540,6 +607,20 @@ mod tests {
             password: None,
             target_name: Some("logs".to_string()),
             enable,
+            persist: PersistOption {
+                enable: false,
+                max_batch: 60,
+            },
+        }
+    }
+
+    fn make_consumer_with_persist(addr: &str, enable: bool) -> Consumer {
+        Consumer {
+            persist: PersistOption {
+                enable: true,
+                max_batch: 4,
+            },
+            ..make_consumer(addr, enable)
         }
     }
 
@@ -570,10 +651,18 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel::<ParsedBatch>();
         let (obs_tx, mut obs_rx) = mpsc::unbounded_channel::<DeliveryEvent>();
 
-        let demux = start_demultiplexer_with_options(cancel_token.clone(), rx, consumers, options(), Some(obs_tx))
-            .await.unwrap();
+        let demux = start_demultiplexer_with_options(
+            cancel_token.clone(),
+            rx,
+            consumers,
+            options(),
+            Some(obs_tx),
+        )
+        .await
+        .unwrap();
 
-        tx.send(ParsedBatch::Str(vec!["alpha".to_string()])).unwrap();
+        tx.send(ParsedBatch::Str(vec!["alpha".to_string()]))
+            .unwrap();
 
         let a = recv_event(&mut obs_rx).await;
         let b = recv_event(&mut obs_rx).await;
@@ -591,15 +680,25 @@ mod tests {
         let second = make_consumer("127.0.0.1:6380", true);
         let first_key = consumer_key(&first);
         let second_key = consumer_key(&second);
-        let consumers = Arc::new(RwLock::new(Consumers { consumers: vec![first, second] }));
+        let consumers = Arc::new(RwLock::new(Consumers {
+            consumers: vec![first, second],
+        }));
         let cancel_token = Arc::new(CancellationToken::new());
         let (tx, rx) = mpsc::unbounded_channel::<ParsedBatch>();
         let (obs_tx, mut obs_rx) = mpsc::unbounded_channel::<DeliveryEvent>();
 
-        let demux = start_demultiplexer_with_options(cancel_token.clone(), rx, consumers.clone(), options(), Some(obs_tx))
-            .await.unwrap();
+        let demux = start_demultiplexer_with_options(
+            cancel_token.clone(),
+            rx,
+            consumers.clone(),
+            options(),
+            Some(obs_tx),
+        )
+        .await
+        .unwrap();
 
-        tx.send(ParsedBatch::Str(vec!["phase1".to_string()])).unwrap();
+        tx.send(ParsedBatch::Str(vec!["phase1".to_string()]))
+            .unwrap();
         let mut p1 = vec![recv_event(&mut obs_rx).await, recv_event(&mut obs_rx).await];
         p1.sort_by(|a, b| a.consumer_key.cmp(&b.consumer_key));
         assert_eq!(p1[0].consumer_key, first_key);
@@ -608,15 +707,21 @@ mod tests {
         consumers.write().await.consumers[1].enable = false;
         tokio::time::sleep(TEST_RECONCILE * 2).await;
 
-        tx.send(ParsedBatch::Str(vec!["phase2".to_string()])).unwrap();
+        tx.send(ParsedBatch::Str(vec!["phase2".to_string()]))
+            .unwrap();
         let p2 = recv_event(&mut obs_rx).await;
         assert_eq!(p2.consumer_key, first_key);
-        assert!(tokio::time::timeout(Duration::from_millis(150), obs_rx.recv()).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), obs_rx.recv())
+                .await
+                .is_err()
+        );
 
         consumers.write().await.consumers[1].enable = true;
         tokio::time::sleep(TEST_RECONCILE * 2).await;
 
-        tx.send(ParsedBatch::Str(vec!["phase3".to_string()])).unwrap();
+        tx.send(ParsedBatch::Str(vec!["phase3".to_string()]))
+            .unwrap();
         let mut p3 = vec![recv_event(&mut obs_rx).await, recv_event(&mut obs_rx).await];
         p3.sort_by(|a, b| a.consumer_key.cmp(&b.consumer_key));
         assert_eq!(p3[0].consumer_key, first_key);
@@ -636,8 +741,15 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel::<ParsedBatch>();
         let (obs_tx, mut obs_rx) = mpsc::unbounded_channel::<DeliveryEvent>();
 
-        let demux = start_demultiplexer_with_options(cancel_token.clone(), rx, consumers, options(), Some(obs_tx))
-            .await.unwrap();
+        let demux = start_demultiplexer_with_options(
+            cancel_token.clone(),
+            rx,
+            consumers,
+            options(),
+            Some(obs_tx),
+        )
+        .await
+        .unwrap();
 
         cancel_token.cancel();
         demux.wait().await;
@@ -660,20 +772,131 @@ mod tests {
         let cancel_token = Arc::new(CancellationToken::new());
         let (tx, rx) = mpsc::unbounded_channel::<ParsedBatch>();
 
-        let demux = start_demultiplexer_with_options(cancel_token.clone(), rx, consumers, options(), None)
-            .await.unwrap();
+        let demux =
+            start_demultiplexer_with_options(cancel_token.clone(), rx, consumers, options(), None)
+                .await
+                .unwrap();
 
         let metrics = demux.metrics();
         tokio::time::timeout(TEST_TIMEOUT, async {
-            while metrics.active_workers() != 2 { tokio::task::yield_now().await; }
-        }).await.expect("workers did not start");
+            while metrics.active_workers() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workers did not start");
 
         tx.send(ParsedBatch::Str(vec!["one".to_string()])).unwrap();
         tokio::time::timeout(TEST_TIMEOUT, async {
-            while metrics.deliveries() < 2 { tokio::task::yield_now().await; }
-        }).await.expect("deliveries not counted");
+            while metrics.deliveries() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deliveries not counted");
 
         assert_eq!(metrics.input_batches(), 1);
+        cancel_token.cancel();
+        drop(tx);
+        demux.wait().await;
+    }
+
+    #[tokio::test]
+    async fn persist_enabled_attaches_logical_index() {
+        let consumers = Arc::new(RwLock::new(Consumers {
+            consumers: vec![make_consumer_with_persist("127.0.0.1:6379", true)],
+        }));
+        let cancel_token = Arc::new(CancellationToken::new());
+        let (tx, rx) = mpsc::unbounded_channel::<ParsedBatch>();
+        let (obs_tx, mut obs_rx) = mpsc::unbounded_channel::<DeliveryEvent>();
+
+        let demux = start_demultiplexer_with_options(
+            cancel_token.clone(),
+            rx,
+            consumers,
+            options(),
+            Some(obs_tx),
+        )
+        .await
+        .unwrap();
+
+        tx.send(ParsedBatch::Str(vec!["persist-me".to_string()]))
+            .unwrap();
+        let ev = recv_event(&mut obs_rx).await;
+        assert!(
+            ev.logical_idx.is_some(),
+            "expected a logical index when persist is enabled"
+        );
+
+        cancel_token.cancel();
+        drop(tx);
+        demux.wait().await;
+    }
+
+    #[tokio::test]
+    async fn no_persist_sends_none_index() {
+        let consumers = Arc::new(RwLock::new(Consumers {
+            consumers: vec![make_consumer("127.0.0.1:6379", true)],
+        }));
+        let cancel_token = Arc::new(CancellationToken::new());
+        let (tx, rx) = mpsc::unbounded_channel::<ParsedBatch>();
+        let (obs_tx, mut obs_rx) = mpsc::unbounded_channel::<DeliveryEvent>();
+
+        let demux = start_demultiplexer_with_options(
+            cancel_token.clone(),
+            rx,
+            consumers,
+            options(),
+            Some(obs_tx),
+        )
+        .await
+        .unwrap();
+
+        tx.send(ParsedBatch::Str(vec!["no-persist".to_string()]))
+            .unwrap();
+        let ev = recv_event(&mut obs_rx).await;
+        assert!(
+            ev.logical_idx.is_none(),
+            "expected no logical index when persist is disabled"
+        );
+
+        cancel_token.cancel();
+        drop(tx);
+        demux.wait().await;
+    }
+
+    #[tokio::test]
+    async fn persist_indices_increment_per_batch() {
+        let consumers = Arc::new(RwLock::new(Consumers {
+            consumers: vec![make_consumer_with_persist("127.0.0.1:6379", true)],
+        }));
+        let cancel_token = Arc::new(CancellationToken::new());
+        let (tx, rx) = mpsc::unbounded_channel::<ParsedBatch>();
+        let (obs_tx, mut obs_rx) = mpsc::unbounded_channel::<DeliveryEvent>();
+
+        let demux = start_demultiplexer_with_options(
+            cancel_token.clone(),
+            rx,
+            consumers,
+            options(),
+            Some(obs_tx),
+        )
+        .await
+        .unwrap();
+
+        for i in 0..3 {
+            tx.send(ParsedBatch::Str(vec![format!("batch-{i}")]))
+                .unwrap();
+        }
+
+        let mut indices: Vec<usize> = Vec::new();
+        for _ in 0..3 {
+            let ev = recv_event(&mut obs_rx).await;
+            indices.push(ev.logical_idx.unwrap());
+        }
+
+        assert_eq!(indices, vec![0, 1, 2]);
+
         cancel_token.cancel();
         drop(tx);
         demux.wait().await;

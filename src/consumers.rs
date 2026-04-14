@@ -27,8 +27,20 @@ pub struct Consumer {
     pub target_name: Option<String>, // can be redis list or elastic index prefix
     #[serde(default = "default_consumer_enable")]
     pub enable: bool,
+    #[serde(default = "default_consumer_persist_option")]
+    pub persist: PersistOption,
 }
-
+#[derive(Debug, Deserialize, Clone)]
+pub struct PersistOption {
+    pub enable: bool,
+    pub max_batch: usize,
+}
+fn default_consumer_persist_option() -> PersistOption {
+    PersistOption {
+        enable: true,
+        max_batch: 60,
+    }
+}
 fn default_consumer_enable() -> bool {
     true
 }

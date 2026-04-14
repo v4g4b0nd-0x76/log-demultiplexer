@@ -27,6 +27,7 @@ async fn main() -> Result<(), MultiplexerError> {
     )?;
 
     let (d_tx, d_rx) = tokio::sync::mpsc::unbounded_channel::<ParsedBatch>();
+    // TODO: there shall be many channels per type by a channel builder to pass the rx vec to parser and tx vec to demultiplexer
     // multi worker dynamic type parser
     let parser = start_parser(Arc::clone(&conf), Arc::clone(&cancel_token), rx, d_tx)?;
     // demultiplexer

@@ -39,7 +39,8 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "http2", "gzip"]
 url = "2.5.8"
 urlencoding = "2.1.3"
 chrono = { version = "0.4.44", features = ["clock"] }
-
+bincode = { version = "2.0.1" , features = ["serde"]}
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
 tokio = { version = "1", features = ["full"] }
+tempfile = "3"

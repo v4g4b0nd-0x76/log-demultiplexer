@@ -6,7 +6,7 @@ use std::{
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use log_demultiplexer::{
     conf::{Config, ParseType, ParsedBatch},
-    consumers::{Consumer, ConsumerType, Consumers},
+    consumers::{Consumer, ConsumerType, Consumers, PersistOption},
     demultiplexer::{Demultiplexer, DemultiplexerMetrics, start_demultiplexer},
 };
 use tokio::sync::{
@@ -44,6 +44,10 @@ impl DemultiplexerBenchHarness {
                     password: None,
                     target_name: Some("bench".to_string()),
                     enable: true,
+                    persist: PersistOption {
+                        enable: true,
+                        max_batch: 60,
+                    },
                 })
                 .collect(),
         }));

@@ -19,19 +19,3 @@ jobs:
 
       - name: Run tests
         run: cargo test --lib --bins -- --test-threads=1
-
-  bench:
-    name: Benchmark (${{ matrix.bench }})
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        bench: [udp_bench, parser_bench, demultiplexer_bench]
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Run ${{ matrix.bench }}
-        run: cargo bench --bench ${{ matrix.bench }}

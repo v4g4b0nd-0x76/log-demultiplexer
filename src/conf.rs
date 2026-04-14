@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Display};
 use tokio::fs;
 
-#[derive(Clone, Debug, serde::Deserialize, PartialEq)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
 pub enum ParsedBatch {
     Str(Vec<String>),
     Json(Vec<serde_json::Value>),
